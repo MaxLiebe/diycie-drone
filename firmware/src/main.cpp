@@ -371,7 +371,7 @@ struct Mpu6050Data
     return s;
   }
 };
-// --------------------------------------------------------------------
+// ---------------------------------------------------------------------
 struct PID
 {
   float kp;
@@ -656,7 +656,6 @@ bool initMpu6050()
   Serial.println("MPU6050: Initialized for drone-style settings");
   return true;
 }
-
 
 // --------------------------------------------------------------------
 // Apply calibration offsets to a sample (still in raw counts)
