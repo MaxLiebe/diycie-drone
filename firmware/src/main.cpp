@@ -11,26 +11,29 @@
 #include <Wire.h>
 #include <Adafruit_NeoPixel.h>
 
-#include <PID.h>         // PID controller
-#include <MadgwickIMU.h> // Madgwick IMU filter
-#include <MPU6050.h>     // MPU6050 driver
+#include <PID.h>             // PID controller
+#include <MadgwickIMU.h>     // Madgwick IMU filter
+#include <MPU6050.h>         // MPU6050 driver
+#include <DroneWebControl.h> // web-based RC control
+
+DroneWebControl web;
 
 // --------------------------------------------------------------------
 // Pin map
 // --------------------------------------------------------------------
 
-const int motorPin1 = 4;
-const int motorPin2 = 0;
-const int motorPin3 = 5;
-const int motorPin4 = 6;
-const int motorPins[4] = {motorPin4, motorPin1, motorPin2, motorPin3};
+const int motorPin1 = 4; // FL (M_TL is connected to GPIO4)
+const int motorPin2 = 5; // FR (M_TR is connected to GPIO5)
+const int motorPin3 = 7; // BR (M_BR is connected to GPIO7)
+const int motorPin4 = 6; // BL (M_BL is connected to GPIO6)
+const int motorPins[4] = {motorPin1, motorPin2, motorPin3, motorPin4};
 const int ledIndex[4] = {3, 0, 1, 2};
 const char *armNames[4] = {"FL", "FR", "BR", "BL"};
 
-#define LED_PIN 7
+#define LED_PIN 21 // LED_O is connected to GPIO21
 #define LED_COUNT 4
-#define I2C_SCL_PIN 10
-#define I2C_SDA_PIN 8
+#define I2C_SCL_PIN 20 // SCL is connected to GPIO20
+#define I2C_SDA_PIN 10 // SDA is connected to GPIO10
 
 Adafruit_NeoPixel leds(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
@@ -61,10 +64,10 @@ static constexpr float DEG2RAD = PI / 180.0f;
 //
 // roll > 0 (right wing UP) -> increase thrust on left motors (FL, BL)
 // pitch > 0 (nose up)          -> increase thrust on front motors (FL, FR)
-// yaw sign depends on spin directions; assuming FL/BR CCW, FR/BL CW:
+// yaw sign depends on spin directions; assuming FL/BR CW, FR/BL CCW:
 const float MIX_ROLL[4] = {+1.0f, -1.0f, -1.0f, +1.0f};  // [FL, FR, BR, BL]
 const float MIX_PITCH[4] = {+1.0f, +1.0f, -1.0f, -1.0f}; // [FL, FR, BR, BL]
-const float MIX_YAW[4] = {-1.0f, +1.0f, -1.0f, +1.0f};   // [FL, FR, BR, BL]
+const float MIX_YAW[4] = {+1.0f, -1.0f, +1.0f, -1.0f};   // [FL, FR, BR, BL]
 
 const float MAX_ANGLE_DEG = 18.0f;    // max commanded tilt
 const float MAX_YAW_RATE_DPS = 90.0f; // max commanded yaw rate
@@ -72,6 +75,9 @@ const float MAX_YAW_RATE_DPS = 90.0f; // max commanded yaw rate
 // Angle-rate mode tuning
 const float MAX_ANGLE_RAD = MAX_ANGLE_DEG * DEG2RAD;
 const float MAX_YAW_RATE_RAD = MAX_YAW_RATE_DPS * DEG2RAD;
+
+static constexpr float INVERT_ANGLE_RAD = 100.0f * DEG2RAD; // ~> upside down threshold
+static constexpr uint32_t INVERT_HOLD_MS = 120;             // debounce
 
 // --------------------------------------------------------------------
 // MPU6050 definitions & constants
@@ -106,10 +112,13 @@ MadgwickIMU madgwick(0.03f); // global filter instance
 // --------------------------------------------------------------------
 
 // PID controllers for roll, pitch, yaw
-PID pidRoll(0.12f, 0.40f, 0.0020f);
-PID pidPitch(0.12f, 0.40f, 0.0020f);
-PID pidYaw(0.08f, 0.25f, 0.0000f);
+// PID pidRoll(0.12f, 0.40f, 0.0020f);
+// PID pidPitch(0.12f, 0.40f, 0.0020f);
+// PID pidYaw(0.08f, 0.25f, 0.0000f);
 
+PID pidRoll(0.12f, 0.0f, 0.0020f);
+PID pidPitch(0.12f, 0.00f, 0.0020f);
+PID pidYaw(0.08f, 0.0f, 0.0000f);
 // Outer P gain: angle error [rad] -> desired rate [rad/s]
 const float ANGLE_TO_RATE_P = 5.0f; // tweak later
 
@@ -151,19 +160,8 @@ void setMotors(const uint8_t pwmValues[4])
     // Current "PWM" for this motor (0..255)
     uint8_t pwm = pwmValues[i];
 
-    uint16_t hueGreen = 21845; // approx 120deg
-    uint16_t hueRed = 0;       // 0deg
-
-    uint16_t hue = (uint16_t)((uint32_t)(255 - pwm) * hueGreen / 255); // green->red
-
-    // Show on the corresponding LED instead of driving the motor
-    // set led brightness
-    uint32_t c = leds.gamma32(leds.ColorHSV(hue, 255, 255));
-    leds.setPixelColor(ledIndex[i], c);
-    leds.show();
-
     // When you want real motors:
-    // analogWrite(motorPins[i], pwmValues[i]);
+    analogWrite(motorPins[i], pwmValues[i]);
   }
 }
 
@@ -172,7 +170,6 @@ void applyMotorOutputs(const float motorOut[4])
 {
   uint8_t pwm[4];
 
-  Serial.print("MOTORS: ");
   for (int i = 0; i < 4; ++i)
   {
     // clamp [0,1]
@@ -185,16 +182,8 @@ void applyMotorOutputs(const float motorOut[4])
     // map to 0..255
     uint8_t p = (uint8_t)(v * 255.0f + 0.5f);
     pwm[i] = p;
-
-    Serial.print(armNames[i]);
-    Serial.print("=");
-    Serial.print(v, 3);
-    if (i < 3)
-      Serial.print("  ");
   }
-  Serial.println();
 
-  // Use your existing LED visualiser + (optionally) motors
   setMotors(pwm);
 }
 
@@ -247,6 +236,7 @@ void controlAngleRate(const Command &cmd, float dt)
   // 5) Apply (clamp & send to LEDs/motors)
   applyMotorOutputs(motorOut);
 }
+Command cmd;
 
 void loopFlightController(const MPU6050::Data &sample)
 {
@@ -280,19 +270,40 @@ void loopFlightController(const MPU6050::Data &sample)
   att.pitchRate = sample.gy_rad();
   att.yawRate = sample.gz_rad();
 
+  // --- Inverted kill (only cut throttle if upside down for a short time) ---
+  static uint32_t invertedSinceMs = 0;
+
+  const bool inverted =
+      (fabsf(att.roll) > INVERT_ANGLE_RAD) ||
+      (fabsf(att.pitch) > INVERT_ANGLE_RAD);
+
+  uint32_t nowMs = millis();
+
+  if (inverted)
+  {
+    if (invertedSinceMs == 0)
+      invertedSinceMs = nowMs;
+
+    if ((nowMs - invertedSinceMs) >= INVERT_HOLD_MS)
+    {
+      cmd.thrust = 0.0f; // CUT THROTTLE
+      cmd.yaw = 0.0f;
+      cmd.roll = 0.0f;
+      cmd.pitch = 0.0f;
+      // optional: also disarm if you want a hard kill:
+      // (you'd need to add cmd.armed to your global Command if you want that)
+    }
+  }
+  else
+  {
+    invertedSinceMs = 0;
+  }
+
   // roll: right-wing-down positive
   float rollAcc = atan2f(sample.ay_g(), sample.az_g()) * 180.0f / PI;
 
   // pitch: nose-down negative
   float pitchAcc = atan2f(-sample.ax_g(), sqrtf(sample.ay_g() * sample.ay_g() + sample.az_g() * sample.az_g())) * 180.0f / PI;
-
-  // 2) Get pilot command (here: zero command for testing)
-  // For testing: serial? command input later
-  Command cmd;
-  cmd.roll = 0.0f;
-  cmd.pitch = 0.0f;
-  cmd.yaw = 0.0f;
-  cmd.thrust = 0.2f; // 20% thrust
 
   // 3) Compute control from pilot command + attitude
   switch (controlMode)
@@ -313,17 +324,40 @@ void loopFlightController(const MPU6050::Data &sample)
 
 void setup()
 {
+
+  cmd.roll = 0.0f;
+  cmd.pitch = 0.0f;
+  cmd.yaw = 0.0f;
+  cmd.thrust = 0.1f;
   Serial.begin(115200);
-  while (!Serial)
-  {
-    delay(10);
-  }
+
+  Serial.printf("Reset reason: %d\n", (int)esp_reset_reason());
+  Serial.printf("Heap: %u\n", ESP.getFreeHeap());
 
   for (int i = 0; i < 4; ++i)
   {
     pinMode(motorPins[i], OUTPUT);
     digitalWrite(motorPins[i], LOW);
   }
+
+  if (!web.begin("DRONE_NET"))
+  {
+    Serial.println("Failed to start AP!");
+    while (true)
+    {
+      ledColor(255, 0, 0);
+      delay(200);
+      ledColor(0, 0, 0);
+      delay(200);
+    }
+  }
+  else
+  {
+    Serial.print("AP IP: ");
+    Serial.println(WiFi.softAPIP());
+  }
+
+  delay(2000);
 
   // I2C init (ESP32-C3: specify SDA/SCL pins)
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
@@ -348,6 +382,7 @@ void setup()
   {
     ledColor(255, 0, 0); // red if error
   }
+  ledColor(0, 0, 0); // all off
 }
 
 // --------------------------------------------------------------------
@@ -356,6 +391,18 @@ void setup()
 
 void loop()
 {
+
+  web.loop(); // keep portal + web server alive
+  delay(1);
+  if (web.hasNewRight())
+  {
+    DroneWebControl::DroneCommand cmd = web.getDroneCommand(true);
+    // Map to our global command
+    ::cmd.roll = cmd.roll;
+    ::cmd.pitch = cmd.pitch;
+    ::cmd.yaw = cmd.yaw;
+    ::cmd.thrust = cmd.thrust;
+  }
 
   if (!mpuOk)
   {
@@ -367,15 +414,28 @@ void loop()
     return;
   }
 
+  // IMU + control at 500 Hz
+  static uint32_t lastImuUs = 0;
+  const uint32_t periodUs = 2000; // 500 Hz
+
+  uint32_t now = micros();
+  if ((uint32_t)(now - lastImuUs) < periodUs)
+    return;
+  lastImuUs += periodUs;
+
   if (imu.update())
   {
-    // For tuning/logging: scaled values
-    // Serial.println(imu.get().toString());
-    loopFlightController(imu.data()); // read only data from imu
+
+    loopFlightController(imu.data());
   }
   else
   {
-    Serial.println("MPU6050: Failed to read sensor");
-    ledColor(255, 0, 0);
+    static uint32_t lastPrint = 0;
+    if (millis() - lastPrint > 500)
+    {
+      lastPrint = millis();
+      Serial.println("MPU6050: Failed to read sensor");
+    }
+    cmd.thrust = 0.0f;
   }
 }
