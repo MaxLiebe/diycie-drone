@@ -97,54 +97,127 @@ struct MPU6050
 
     void calibrate(int N = 500)
     {
-        // Average raw readings while still
         long sumAx = 0, sumAy = 0, sumAz = 0;
         long sumGx = 0, sumGy = 0, sumGz = 0;
-
         Data s;
 
+        // Warm-up: let the sensor settle
         for (int i = 0; i < 50; ++i)
         {
             readRaw(s);
             delay(5);
         }
 
+        // Accumulate N samples
         for (int i = 0; i < N; ++i)
         {
             while (!readRaw(s))
                 delay(1);
-
             sumAx += s.accelX;
             sumAy += s.accelY;
             sumAz += s.accelZ;
             sumGx += s.gyroX;
             sumGy += s.gyroY;
             sumGz += s.gyroZ;
-
-            delay(5);
+            delay(2);
         }
 
         const float avgAx = (float)sumAx / N;
         const float avgAy = (float)sumAy / N;
         const float avgAz = (float)sumAz / N;
 
-        const float avgGx = (float)sumGx / N;
-        const float avgGy = (float)sumGy / N;
-        const float avgGz = (float)sumGz / N;
+        // ── Rodrigues: rotate measured gravity vector onto (0,0,1) ──────────────
+        //
+        // gS = measured gravity in sensor frame (normalised)
+        // zB = target gravity direction in body frame = (0, 0, 1)  [FRD, down]
+        //
+        // rotation axis  v = gS × zB
+        // cross product of (gx,gy,gz) × (0,0,1):
+        //   vx =  gy*1 - gz*0 =  gy
+        //   vy =  gz*0 - gx*1 = -gx
+        //   vz =  gx*0 - gy*0 =  0
+        //
+        // cos(angle) c = gS · zB = gz  (after normalisation)
+        // sin(angle) s_mag = |v|
 
-        // FRD at rest should be: ax≈0, ay≈0, az≈ +1g (down)
-        accelBiasX = (int16_t)avgAx;
-        accelBiasY = (int16_t)avgAy;
-        accelBiasZ = (int16_t)(avgAz - Data::ACCEL_SENS_4G);
+        float mag = sqrtf(avgAx * avgAx + avgAy * avgAy + avgAz * avgAz);
+        float gx = avgAx / mag;
+        float gy = avgAy / mag;
+        float gz = avgAz / mag;
 
-        gyroBiasX = (int16_t)avgGx;
-        gyroBiasY = (int16_t)avgGy;
-        gyroBiasZ = (int16_t)avgGz;
+        float vx = gy;
+        float vy = -gx;
+        float vz = 0.0f;
+        float s_mag = sqrtf(vx * vx + vy * vy); // vz is always 0
+        float c_val = gz;                       // dot product with (0,0,1)
+
+        if (s_mag < 1e-6f)
+        {
+            // Already (nearly) aligned — keep identity
+            R[0][0] = 1;
+            R[0][1] = 0;
+            R[0][2] = 0;
+            R[1][0] = 0;
+            R[1][1] = 1;
+            R[1][2] = 0;
+            R[2][0] = 0;
+            R[2][1] = 0;
+            R[2][2] = 1;
+        }
+        else
+        {
+            // Rodrigues' formula:  R = I + [v]× + [v]×² · (1-c)/s²
+            //
+            // [v]× (skew-symmetric):          [v]×²:
+            //  [ 0  -vz  vy ]                 [-vz²-vy²   vx·vy   vx·vz]
+            //  [ vz   0  -vx]                 [ vx·vy  -vz²-vx²   vy·vz]
+            //  [-vy  vx   0 ]                 [ vx·vz   vy·vz  -vy²-vx²]
+
+            float k = (1.0f - c_val) / (s_mag * s_mag);
+
+            R[0][0] = 1.0f + k * (-vz * vz - vy * vy);
+            R[0][1] = k * (vx * vy) - vz;
+            R[0][2] = k * (vx * vz) + vy;
+            R[1][0] = k * (vx * vy) + vz;
+            R[1][1] = 1.0f + k * (-vz * vz - vx * vx);
+            R[1][2] = k * (vy * vz) - vx;
+            R[2][0] = k * (vx * vz) - vy;
+            R[2][1] = k * (vy * vz) + vx;
+            R[2][2] = 1.0f + k * (-vy * vy - vx * vx);
+        }
+
+        // ── Biases: residual offsets measured AFTER the rotation is applied ──────
+        // Rotate the averaged raw vector by R, then subtract the expected (0,0,+g)
+        float cAx = R[0][0] * avgAx + R[0][1] * avgAy + R[0][2] * avgAz;
+        float cAy = R[1][0] * avgAx + R[1][1] * avgAy + R[1][2] * avgAz;
+        float cAz = R[2][0] * avgAx + R[2][1] * avgAy + R[2][2] * avgAz;
+
+        accelBiasX = (int16_t)cAx;
+        accelBiasY = (int16_t)cAy;
+        accelBiasZ = (int16_t)(cAz - Data::ACCEL_SENS_4G);
+
+        // Gyro bias is a pure offset (direction-invariant), rotate it too
+        // so it lives in the same body frame as the corrected readings
+        float avgGx = (float)sumGx / N;
+        float avgGy = (float)sumGy / N;
+        float avgGz = (float)sumGz / N;
+
+        float cGx = R[0][0] * avgGx + R[0][1] * avgGy + R[0][2] * avgGz;
+        float cGy = R[1][0] * avgGx + R[1][1] * avgGy + R[1][2] * avgGz;
+        float cGz = R[2][0] * avgGx + R[2][1] * avgGy + R[2][2] * avgGz;
+
+        gyroBiasX = (int16_t)cGx;
+        gyroBiasY = (int16_t)cGy;
+        gyroBiasZ = (int16_t)cGz;
     }
 
     // Biases (public if you want to save/load them)
     int16_t accelBiasX = 0, accelBiasY = 0, accelBiasZ = 0;
     int16_t gyroBiasX = 0, gyroBiasY = 0, gyroBiasZ = 0;
+
+    // Mounting-offset rotation matrix (sensor frame -> body frame)
+    // Identity by default; computed by calibrate()
+    float R[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
 
 private:
     // ---- MPU regs ----
@@ -176,7 +249,7 @@ private:
         if (wire->endTransmission(false) != 0)
             return false;
 
-        uint8_t got = wire->requestFrom(addr, length, true);
+        uint8_t got = (uint8_t)wire->requestFrom((uint8_t)addr, (uint8_t)length, (uint8_t)1);
         if (got != length)
             return false;
 
@@ -192,16 +265,16 @@ private:
         if (!readBytes(REG_ACCEL, raw, sizeof(raw)))
             return false;
 
-        d.accelX = -(int16_t)((raw[0] << 8) | raw[1]);
-        d.accelY = (int16_t)((raw[2] << 8) | raw[3]);
+        d.accelX = (int16_t)((raw[0] << 8) | raw[1]);
+        d.accelY = -(int16_t)((raw[2] << 8) | raw[3]); // solved
         d.accelZ = (int16_t)((raw[4] << 8) | raw[5]);
 
         int16_t tempRaw = (int16_t)((raw[6] << 8) | raw[7]);
         d.temperatureC = (tempRaw / 340.0f) + 36.53f;
 
-        d.gyroX = (int16_t)((raw[8] << 8) | raw[9]);
-        d.gyroY = -(int16_t)((raw[10] << 8) | raw[11]);
-        d.gyroZ = (int16_t)((raw[12] << 8) | raw[13]);
+        d.gyroX = -(int16_t)((raw[8] << 8) | raw[9]);
+        d.gyroY = (int16_t)((raw[10] << 8) | raw[11]); // solved
+        d.gyroZ = -(int16_t)((raw[12] << 8) | raw[13]);
 
         d.timestampMs = millis();
         return true;
@@ -209,12 +282,23 @@ private:
 
     void applyCalibration(Data &d)
     {
-        d.accelX -= accelBiasX;
-        d.accelY -= accelBiasY;
-        d.accelZ -= accelBiasZ;
-        d.gyroX -= gyroBiasX;
-        d.gyroY -= gyroBiasY;
-        d.gyroZ -= gyroBiasZ;
+        // Step 1 — rotate from sensor frame into body frame
+        float ax = R[0][0] * d.accelX + R[0][1] * d.accelY + R[0][2] * d.accelZ;
+        float ay = R[1][0] * d.accelX + R[1][1] * d.accelY + R[1][2] * d.accelZ;
+        float az = R[2][0] * d.accelX + R[2][1] * d.accelY + R[2][2] * d.accelZ;
+
+        float gx = R[0][0] * d.gyroX + R[0][1] * d.gyroY + R[0][2] * d.gyroZ;
+        float gy = R[1][0] * d.gyroX + R[1][1] * d.gyroY + R[1][2] * d.gyroZ;
+        float gz = R[2][0] * d.gyroX + R[2][1] * d.gyroY + R[2][2] * d.gyroZ;
+
+        // Step 2 — subtract residual bias (already in body frame)
+        d.accelX = (int16_t)(ax)-accelBiasX;
+        d.accelY = (int16_t)(ay)-accelBiasY;
+        d.accelZ = (int16_t)(az)-accelBiasZ;
+
+        d.gyroX = (int16_t)(gx)-gyroBiasX;
+        d.gyroY = (int16_t)(gy)-gyroBiasY;
+        d.gyroZ = (int16_t)(gz)-gyroBiasZ;
     }
 };
 

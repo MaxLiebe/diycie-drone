@@ -15,7 +15,7 @@ struct PID
     float prevError;
     float outMin, outMax; // clamp
 
-    PID(float p = 0, float i = 0, float d = 0, float minOut = -1.0f, float maxOut = 1.0f)
+    PID(float p = 0, float i = 0, float d = 0, float minOut = -2.0f, float maxOut = 2.0f)
         : kp(p), ki(i), kd(d),
           integrator(0.0f), prevError(0.0f),
           outMin(minOut), outMax(maxOut) {}

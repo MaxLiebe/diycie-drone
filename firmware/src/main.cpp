@@ -15,20 +15,25 @@
 #include <MadgwickIMU.h>     // Madgwick IMU filter
 #include <MPU6050.h>         // MPU6050 driver
 #include <DroneWebControl.h> // web-based RC control
+// At the top of your file, add:
+#include "MotorSong.h"
+#include "MarioTheme.h"
 
 DroneWebControl web;
-
 // --------------------------------------------------------------------
 // Pin map
 // --------------------------------------------------------------------
+const int motorPinFL = 5; // TopLeft (D3)
+const int motorPinFR = 4; // TopRight (D2)
+const int motorPinBR = 6; // BackRight (D4)
+const int motorPinBL = 7; // BackLeft (D5)
 
-const int motorPin1 = 4; // FL (M_TL is connected to GPIO4)
-const int motorPin2 = 5; // FR (M_TR is connected to GPIO5)
-const int motorPin3 = 7; // BR (M_BR is connected to GPIO7)
-const int motorPin4 = 6; // BL (M_BL is connected to GPIO6)
-const int motorPins[4] = {motorPin1, motorPin2, motorPin3, motorPin4};
+// The array must follow the [FL, FR, BR, BL] order
+const int motorPins[4] = {motorPinFL, motorPinFR, motorPinBR, motorPinBL};
 const int ledIndex[4] = {3, 0, 1, 2};
 const char *armNames[4] = {"FL", "FR", "BR", "BL"};
+
+MotorSong motorSong(motorPins, 4, /*volume=*/12);
 
 #define LED_PIN 21 // LED_O is connected to GPIO21
 #define LED_COUNT 4
@@ -65,9 +70,10 @@ static constexpr float DEG2RAD = PI / 180.0f;
 // roll > 0 (right wing UP) -> increase thrust on left motors (FL, BL)
 // pitch > 0 (nose up)          -> increase thrust on front motors (FL, FR)
 // yaw sign depends on spin directions; assuming FL/BR CW, FR/BL CCW:
-const float MIX_ROLL[4] = {+1.0f, -1.0f, -1.0f, +1.0f};  // [FL, FR, BR, BL]
-const float MIX_PITCH[4] = {+1.0f, +1.0f, -1.0f, -1.0f}; // [FL, FR, BR, BL]
-const float MIX_YAW[4] = {+1.0f, -1.0f, +1.0f, -1.0f};   // [FL, FR, BR, BL]
+// [FL, FR, BR, BL] format
+const float MIX_ROLL[4] = {-1.0f, +1.0f, +1.0f, -1.0f};
+const float MIX_PITCH[4] = {-1.0f, -1.0f, +1.0f, +1.0f};
+const float MIX_YAW[4] = {+1.0f, -1.0f, +1.0f, -1.0f};
 
 const float MAX_ANGLE_DEG = 18.0f;    // max commanded tilt
 const float MAX_YAW_RATE_DPS = 90.0f; // max commanded yaw rate
@@ -116,11 +122,11 @@ MadgwickIMU madgwick(0.03f); // global filter instance
 // PID pidPitch(0.12f, 0.40f, 0.0020f);
 // PID pidYaw(0.08f, 0.25f, 0.0000f);
 
-PID pidRoll(0.12f, 0.0f, 0.0020f);
-PID pidPitch(0.12f, 0.00f, 0.0020f);
-PID pidYaw(0.08f, 0.0f, 0.0000f);
+PID pidRoll(0.10f, 0.075f, 0.0000f);
+PID pidPitch(0.10f, 0.075f, 0.0000f);
+PID pidYaw(0.10f, 0.075f, 0.0000f);
 // Outer P gain: angle error [rad] -> desired rate [rad/s]
-const float ANGLE_TO_RATE_P = 5.0f; // tweak later
+const float ANGLE_TO_RATE_P = 1.0f; // tweak later
 
 // --------------------------------------------------------------------
 // LED helpers
@@ -222,7 +228,7 @@ void controlAngleRate(const Command &cmd, float dt)
   // 3) Inner rate PIDs (already defined globally)
   float rollCmd = pidRoll.update(dt, rollRateSet, att.rollRate);
   float pitchCmd = pidPitch.update(dt, pitchRateSet, att.pitchRate);
-  float yawCmd = pidYaw.update(dt, yawRateSet, att.yawRate);
+  float yawCmd = pidYaw.update(dt, yawRateSet, -att.yawRate);
 
   // 4) Mixer: base thrust + axis commands
   float motorOut[4];
@@ -266,6 +272,23 @@ void loopFlightController(const MPU6050::Data &sample)
       dt);
 
   madgwick.toEulerFRD(att.roll, att.pitch, att.yaw);
+
+  // ---- BENCH TEST: comment out before flying ----
+  // static uint32_t lastPrint = 0;
+  // if (millis() - lastPrint > 200)
+  // {
+  //   lastPrint = millis();
+  //   Serial.printf("R:%6.1f  P:%6.1f  Y:%6.1f  | rR:%6.1f  rP:%6.1f  rY:%6.1f\n",
+  //                 att.roll * 180.0f / PI,
+  //                 att.pitch * 180.0f / PI,
+  //                 att.yaw * 180.0f / PI,
+  //                 att.rollRate * 180.0f / PI,
+  //                 att.pitchRate * 180.0f / PI,
+  //                 att.yawRate * 180.0f / PI);
+  // }
+
+  // ---- END BENCH TEST ----
+
   att.rollRate = sample.gx_rad();
   att.pitchRate = sample.gy_rad();
   att.yawRate = sample.gz_rad();
@@ -278,6 +301,15 @@ void loopFlightController(const MPU6050::Data &sample)
       (fabsf(att.pitch) > INVERT_ANGLE_RAD);
 
   uint32_t nowMs = millis();
+
+  // If throttle is very low, the drone is likely on the ground.
+  // We must prevent Integral Windup by resetting the PID loops.
+  if (cmd.thrust < 0.05f)
+  {
+    pidRoll.reset();
+    pidPitch.reset();
+    pidYaw.reset();
+  }
 
   if (inverted)
   {
@@ -331,41 +363,8 @@ void setup()
   cmd.thrust = 0.1f;
   Serial.begin(115200);
 
-  Serial.printf("Reset reason: %d\n", (int)esp_reset_reason());
-  Serial.printf("Heap: %u\n", ESP.getFreeHeap());
-
-  for (int i = 0; i < 4; ++i)
-  {
-    pinMode(motorPins[i], OUTPUT);
-    digitalWrite(motorPins[i], LOW);
-  }
-
-  if (!web.begin("DRONE_NET"))
-  {
-    Serial.println("Failed to start AP!");
-    while (true)
-    {
-      ledColor(255, 0, 0);
-      delay(200);
-      ledColor(0, 0, 0);
-      delay(200);
-    }
-  }
-  else
-  {
-    Serial.print("AP IP: ");
-    Serial.println(WiFi.softAPIP());
-  }
-
-  delay(2000);
-
   // I2C init (ESP32-C3: specify SDA/SCL pins)
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-
-  // LEDs
-  leds.begin();
-  leds.setBrightness(50);
-  ledColor(0, 0, 0); // all off
 
   Serial.println("MPU6050 + NeoPixel (modular) starting...");
 
@@ -373,16 +372,61 @@ void setup()
   ledColor(0, 0, 255); // blue while initializing
   mpuOk = imu.begin(Wire);
 
-  if (mpuOk)
-  {
-    ledColor(0, 255, 0); // green if OK
-    imu.calibrate(500);
-  }
-  else
+  if (!mpuOk)
   {
     ledColor(255, 0, 0); // red if error
   }
-  ledColor(0, 0, 0); // all off
+  else
+  {
+    // if mpu0k, it will turn green later after calibration, in the main loop
+    ledColor(0, 255, 0); // green if OK
+    imu.calibrate(500);
+
+    analogWriteFrequency(32000);
+    analogWriteResolution(8);
+
+    for (int i = 0; i < 4; ++i)
+    {
+      pinMode(motorPins[i], OUTPUT);
+      digitalWrite(motorPins[i], LOW);
+    }
+    // // Play startup song on motors (blocking until finished)
+    motorSong.setRestoreFrequency(32000); // restore to your 32kHz flight freq
+    motorSong.begin(MARIO_THEME, MARIO_THEME_LEN);
+    while (motorSong.play())
+    {
+      // nothing else needed here, just let it finish
+    }
+
+    // LEDs
+    leds.begin();
+    leds.setBrightness(50);
+    ledColor(0, 0, 0); // all off
+
+    Serial.printf("Reset reason: %d\n", (int)esp_reset_reason());
+    Serial.printf("Heap: %u\n", ESP.getFreeHeap());
+
+    if (!web.begin("DRONE_NET"))
+    {
+      Serial.println("Failed to start AP!");
+      while (true)
+      {
+        ledColor(255, 0, 0);
+        delay(200);
+        ledColor(0, 0, 0);
+        delay(200);
+      }
+    }
+    else
+    {
+      Serial.print("AP IP: ");
+      Serial.println(WiFi.softAPIP());
+    }
+
+    delay(2000);
+
+    ledColor(0, 0, 0); // all off
+  }
 }
 
 // --------------------------------------------------------------------

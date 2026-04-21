@@ -24,6 +24,7 @@ struct MadgwickIMU
                 float ax, float ay, float az,
                 float dt)
     {
+
         float q1 = this->q1;
         float q2 = this->q2;
         float q3 = this->q3;
