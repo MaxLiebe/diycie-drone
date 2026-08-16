@@ -5,6 +5,9 @@
 
 struct MPU6050
 {
+    const float ACCEL_SCALE_X = 0.997124f;
+    const float ACCEL_SCALE_Y = 1.000907f;
+    const float ACCEL_SCALE_Z = 0.956723f;
     // ---- Public sample type ----
     struct Data
     {
@@ -70,7 +73,7 @@ struct MPU6050
             return false; // wake
         if (!writeByte(REG_CONFIG, 0x03))
             return false; // DLPF 42 Hz
-        if (!writeByte(REG_SMPLRT_DIV, 1))
+        if (!writeByte(REG_SMPLRT_DIV, 0))
             return false; // 500 Hz output
         if (!writeByte(REG_GYRO_CFG, 0x18))
             return false; // ±2000 dps
@@ -94,6 +97,9 @@ struct MPU6050
 
     // get a copy of the latest sample
     Data get() const { return sample; }
+
+    // Read raw sensor data into d (without applying calibration). Returns true on success.
+    bool readRawSample(Data &d) { return readRaw(d); }
 
     void calibrate(int N = 500)
     {
@@ -173,28 +179,35 @@ struct MPU6050
             //  [ vz   0  -vx]                 [ vx·vy  -vz²-vx²   vy·vz]
             //  [-vy  vx   0 ]                 [ vx·vz   vy·vz  -vy²-vx²]
 
-            float k = (1.0f - c_val) / (s_mag * s_mag);
+            // Normalise the rotation axis before using in Rodrigues
+            float inv_s = 1.0f / s_mag;
+            float nvx = vx * inv_s;
+            float nvy = vy * inv_s;
+            float nvz = 0.0f; // always 0
 
-            R[0][0] = 1.0f + k * (-vz * vz - vy * vy);
-            R[0][1] = k * (vx * vy) - vz;
-            R[0][2] = k * (vx * vz) + vy;
-            R[1][0] = k * (vx * vy) + vz;
-            R[1][1] = 1.0f + k * (-vz * vz - vx * vx);
-            R[1][2] = k * (vy * vz) - vx;
-            R[2][0] = k * (vx * vz) - vy;
-            R[2][1] = k * (vy * vz) + vx;
-            R[2][2] = 1.0f + k * (-vy * vy - vx * vx);
+            float sin_t = s_mag;      // sin(θ) = magnitude of un-normalised cross product
+            float k = (1.0f - c_val); // (1 - cos(θ))
+
+            R[0][0] = 1.0f + k * (-nvz * nvz - nvy * nvy);
+            R[0][1] = k * (nvx * nvy) - sin_t * nvz; // nvz=0, so: k*(nvx*nvy)
+            R[0][2] = k * (nvx * nvz) + sin_t * nvy; // nvz=0, so: sin_t*nvy
+            R[1][0] = k * (nvx * nvy) + sin_t * nvz; // nvz=0, so: k*(nvx*nvy)
+            R[1][1] = 1.0f + k * (-nvz * nvz - nvx * nvx);
+            R[1][2] = k * (nvy * nvz) - sin_t * nvx; // nvz=0, so: -sin_t*nvx
+            R[2][0] = k * (nvx * nvz) - sin_t * nvy; // nvz=0, so: -sin_t*nvy
+            R[2][1] = k * (nvy * nvz) + sin_t * nvx; // nvz=0, so: +sin_t*nvx
+            R[2][2] = 1.0f + k * (-nvy * nvy - nvx * nvx);
         }
 
-        // ── Biases: residual offsets measured AFTER the rotation is applied ──────
-        // Rotate the averaged raw vector by R, then subtract the expected (0,0,+g)
+        // After rotating the averaged raw vector:
         float cAx = R[0][0] * avgAx + R[0][1] * avgAy + R[0][2] * avgAz;
         float cAy = R[1][0] * avgAx + R[1][1] * avgAy + R[1][2] * avgAz;
         float cAz = R[2][0] * avgAx + R[2][1] * avgAy + R[2][2] * avgAz;
 
-        accelBiasX = (int16_t)cAx;
-        accelBiasY = (int16_t)cAy;
-        accelBiasZ = (int16_t)(cAz - Data::ACCEL_SENS_4G);
+        // Apply scale before storing bias so units match applyCalibration
+        accelBiasX = (int16_t)roundf(cAx * ACCEL_SCALE_X);
+        accelBiasY = (int16_t)roundf(cAy * ACCEL_SCALE_Y);
+        accelBiasZ = (int16_t)roundf(cAz * ACCEL_SCALE_Z) - (int16_t)(Data::ACCEL_SENS_4G * ACCEL_SCALE_Z);
 
         // Gyro bias is a pure offset (direction-invariant), rotate it too
         // so it lives in the same body frame as the corrected readings
@@ -218,6 +231,25 @@ struct MPU6050
     // Mounting-offset rotation matrix (sensor frame -> body frame)
     // Identity by default; computed by calibrate()
     float R[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+
+    String calibrationToString() const
+    {
+        String s;
+        s.reserve(100);
+        s += "Accel Biases: X=";
+        s += accelBiasX;
+        s += ", Y=";
+        s += accelBiasY;
+        s += ", Z=";
+        s += accelBiasZ;
+        s += " | Gyro Biases: X=";
+        s += gyroBiasX;
+        s += ", Y=";
+        s += gyroBiasY;
+        s += ", Z=";
+        s += gyroBiasZ;
+        return s;
+    }
 
 private:
     // ---- MPU regs ----
@@ -282,23 +314,28 @@ private:
 
     void applyCalibration(Data &d)
     {
-        // Step 1 — rotate from sensor frame into body frame
-        float ax = R[0][0] * d.accelX + R[0][1] * d.accelY + R[0][2] * d.accelZ;
-        float ay = R[1][0] * d.accelX + R[1][1] * d.accelY + R[1][2] * d.accelZ;
-        float az = R[2][0] * d.accelX + R[2][1] * d.accelY + R[2][2] * d.accelZ;
+        // Step 0: scale correction (float, no truncation)
+        float sx = d.accelX * ACCEL_SCALE_X;
+        float sy = d.accelY * ACCEL_SCALE_Y;
+        float sz = d.accelZ * ACCEL_SCALE_Z;
+
+        // Step 1: rotate
+        float ax = R[0][0] * sx + R[0][1] * sy + R[0][2] * sz;
+        float ay = R[1][0] * sx + R[1][1] * sy + R[1][2] * sz;
+        float az = R[2][0] * sx + R[2][1] * sy + R[2][2] * sz;
 
         float gx = R[0][0] * d.gyroX + R[0][1] * d.gyroY + R[0][2] * d.gyroZ;
         float gy = R[1][0] * d.gyroX + R[1][1] * d.gyroY + R[1][2] * d.gyroZ;
         float gz = R[2][0] * d.gyroX + R[2][1] * d.gyroY + R[2][2] * d.gyroZ;
 
-        // Step 2 — subtract residual bias (already in body frame)
-        d.accelX = (int16_t)(ax)-accelBiasX;
-        d.accelY = (int16_t)(ay)-accelBiasY;
-        d.accelZ = (int16_t)(az)-accelBiasZ;
+        // Step 2: subtract bias (single int16 conversion at the end)
+        d.accelX = (int16_t)roundf(ax) - accelBiasX;
+        d.accelY = (int16_t)roundf(ay) - accelBiasY;
+        d.accelZ = (int16_t)roundf(az) - accelBiasZ;
 
-        d.gyroX = (int16_t)(gx)-gyroBiasX;
-        d.gyroY = (int16_t)(gy)-gyroBiasY;
-        d.gyroZ = (int16_t)(gz)-gyroBiasZ;
+        d.gyroX = (int16_t)roundf(gx) - gyroBiasX;
+        d.gyroY = (int16_t)roundf(gy) - gyroBiasY;
+        d.gyroZ = (int16_t)roundf(gz) - gyroBiasZ;
     }
 };
 

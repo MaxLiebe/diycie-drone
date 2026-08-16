@@ -1,56 +1,157 @@
-
-#ifndef PID_H
-#define PID_H
+// =============================================================================
+//  PID.h — rate-loop PID controller, esp-fc-style.
+//
+//  Improvements over previous version:
+//    • Cascaded D-term filtering: optional Notch + PT1 + PT2 (esp-fc layout)
+//    • Setpoint-derivative feed-forward with PT1 smoothing (Kf)
+//    • I-term relax (esp-fc: factor on |setpoint - LPF(setpoint)|)
+//    • True saturation-aware anti-windup using an external saturation flag
+//      that the mixer feeds back when any motor clipped
+//    • D-on-measurement (no setpoint kicks) using running rate (Hz) — exact
+//      match to esp-fc Pid::update().
+//
+//  All filters use Filter.h (header-only). Same numerics as esp-fc.
+// =============================================================================
+#ifndef FC_PID_H
+#define FC_PID_H
 
 #include <Arduino.h>
+#include "Filter.h"
 
-// ---------------------------------------------------------------------
 struct PID
 {
-    float kp;
-    float ki;
-    float kd;
+  // ── Tuning (set once) ─────────────────────────────────────────────────────
+  float kp = 0.0f;
+  float ki = 0.0f;
+  float kd = 0.0f;
+  float kf = 0.0f;          // setpoint feed-forward (rate of change)
 
-    float integrator;
-    float prevError;
-    float outMin, outMax; // clamp
+  float outMin = -1.0f;
+  float outMax =  1.0f;
 
-    PID(float p = 0, float i = 0, float d = 0, float minOut = -2.0f, float maxOut = 2.0f)
-        : kp(p), ki(i), kd(d),
-          integrator(0.0f), prevError(0.0f),
-          outMin(minOut), outMax(maxOut) {}
+  float iLimit = 0.5f;      // |I-term| clamp (output-units)
 
-    float update(float dt, float setpoint, float measurement)
+  // I-term relax: scale I error down when stick is moving fast, like esp-fc.
+  // 0 = off. typical 15..30 (deg/s scale). Small = aggressive relax.
+  float relaxRateDps = 20.0f;
+
+  // ── State ────────────────────────────────────────────────────────────────
+  float integrator = 0.0f;
+  float prevMeasurement = 0.0f;
+  float prevSetpoint = 0.0f;
+  bool  outputSaturated = false;     // set externally by mixer if it clipped
+
+  // Filters (init via configure())
+  fc::Biquad dNotch;     // optional resonance notch on D
+  fc::PT1    dLpf1;      // primary D LPF
+  fc::PT2    dLpf2;      // secondary D LPF (esp-fc cascade)
+  fc::PT1    fLpf;       // F-term smoothing
+  fc::PT1    relaxLpf;   // I-term relax setpoint LPF
+
+  // ── Configuration ─────────────────────────────────────────────────────────
+  // Call once in setup(), after sample-rate is known.
+  // Pass 0 to any cutoff to disable that stage.
+  void configure(float sampleRateHz,
+                 float dLpfHz   = 90.0f,   // primary D LPF
+                 float dLpf2Hz  = 150.0f,  // secondary D LPF
+                 float fLpfHz   = 25.0f,   // F-term LPF (setpoint smoothing FF)
+                 float relaxHz  = 8.0f,    // I-term relax setpoint cutoff
+                 float dNotchHz = 0.0f,    // 0 = disabled
+                 float dNotchCutoffHz = 0.0f)
+  {
+    dLpf1.init(sampleRateHz, dLpfHz);
+    dLpf2.init(sampleRateHz, dLpf2Hz);
+    fLpf .init(sampleRateHz, fLpfHz);
+    relaxLpf.init(sampleRateHz, relaxHz);
+
+    if (dNotchHz > 0.0f && dNotchCutoffHz > 0.0f)
     {
-        float error = setpoint - measurement;
+      const float q = fc::Biquad::notchQ(dNotchHz, dNotchCutoffHz);
+      dNotch.init(fc::Biquad::NOTCH, sampleRateHz, dNotchHz, q);
+    }
+    else
+    {
+      dNotch.b0 = 1.0f; dNotch.b1 = dNotch.b2 = dNotch.a1 = dNotch.a2 = 0.0f;
+    }
+    reset();
+  }
 
-        // P
-        float P = kp * error;
+  void reset()
+  {
+    integrator = 0.0f;
+    prevMeasurement = 0.0f;
+    prevSetpoint = 0.0f;
+    outputSaturated = false;
+    dNotch.reset();
+    dLpf1.reset();
+    dLpf2.reset();
+    fLpf.reset();
+    relaxLpf.reset();
+  }
 
-        // I
-        integrator += error * dt;
-        float I = ki * integrator;
+  // ── Update ────────────────────────────────────────────────────────────────
+  // setpoint, measurement: same units (rad/s recommended for rate loop).
+  // dt: seconds (used only for I & error derivative). Sample rate fixed at
+  //     configure() time for filter coefficients — call at that rate.
+  inline float update(float dt, float setpoint, float measurement)
+  {
+    if (dt <= 0.0f) dt = 1e-3f;
 
-        // D (derivative on measurement)
-        float derivative = (error - prevError) / dt;
-        float D = kd * derivative;
+    // --- P -----------------------------------------------------------------
+    const float error = setpoint - measurement;
+    const float P = kp * error;
 
-        float out = P + I + D;
-
-        // clamp output
-        if (out > outMax)
-            out = outMax;
-        if (out < outMin)
-            out = outMin;
-
-        prevError = error;
-        return out;
+    // --- D on measurement (sign flip), notch + cascade LPF -----------------
+    float D = 0.0f;
+    if (kd > 0.0f)
+    {
+      float rawD = -(measurement - prevMeasurement) / dt;
+      rawD = dNotch.update(rawD);
+      rawD = dLpf1 .update(rawD);
+      rawD = dLpf2 .update(rawD);
+      D = kd * rawD;
     }
 
-    void reset()
+    // --- F (setpoint derivative, smoothed) ---------------------------------
+    float F = 0.0f;
+    if (kf > 0.0f)
     {
-        integrator = 0.0f;
-        prevError = 0.0f;
+      const float rawF = (setpoint - prevSetpoint) / dt;
+      F = kf * fLpf.update(rawF);
     }
+
+    // --- I with relax + saturation-aware anti-windup -----------------------
+    float iErr = error;
+    if (ki > 0.0f && relaxRateDps > 0.0f)
+    {
+      // esp-fc: relaxBase = setpoint - LPF(setpoint)
+      const float relaxBase = setpoint - relaxLpf.update(setpoint);
+      // factor = max(0, 1 - |relaxBase[deg/s]| / relaxRateDps)
+      const float baseDps = relaxBase * (180.0f / PI);
+      float factor = 1.0f - fabsf(baseDps) / relaxRateDps;
+      if (factor < 0.0f) factor = 0.0f;
+      iErr *= factor;
+    }
+
+    if (ki > 0.0f && !outputSaturated)
+    {
+      integrator += iErr * dt;
+      const float iLim = iLimit / ki;
+      if (integrator >  iLim) integrator =  iLim;
+      if (integrator < -iLim) integrator = -iLim;
+    }
+    const float I = ki * integrator;
+
+    // Pre-clamp output
+    float out = P + I + D + F;
+    if (out > outMax) out = outMax;
+    if (out < outMin) out = outMin;
+
+    prevMeasurement = measurement;
+    prevSetpoint    = setpoint;
+
+    return out;
+  }
 };
-#endif // PID_H
+
+#endif // FC_PID_H
