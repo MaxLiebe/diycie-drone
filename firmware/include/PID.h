@@ -1,14 +1,21 @@
 // =============================================================================
 //  PID.h — rate-loop PID controller, esp-fc-style.
 //
-//  Improvements over previous version:
 //    • Cascaded D-term filtering: optional Notch + PT1 + PT2 (esp-fc layout)
 //    • Setpoint-derivative feed-forward with PT1 smoothing (Kf)
 //    • I-term relax (esp-fc: factor on |setpoint - LPF(setpoint)|)
-//    • True saturation-aware anti-windup using an external saturation flag
-//      that the mixer feeds back when any motor clipped
-//    • D-on-measurement (no setpoint kicks) using running rate (Hz) — exact
-//      match to esp-fc Pid::update().
+//    • Saturation-aware anti-windup using an external saturation flag that the
+//      mixer feeds back when any motor clipped
+//    • D-on-measurement (no setpoint kicks)
+//
+//  Changes vs previous revision:
+//    • First update() after reset() primes prevMeasurement/prevSetpoint instead
+//      of differentiating from 0 → no D/F kick on the first tick after arming.
+//    • Anti-windup is now "conditional integration": when the mixer reports
+//      saturation the integrator is only frozen if integrating would push the
+//      output further INTO saturation. It may still unwind. Previously all
+//      three axes froze whenever any motor clipped, so a hard yaw/thrust move
+//      could stall the roll/pitch I-terms and let the attitude sag.
 //
 //  All filters use Filter.h (header-only). Same numerics as esp-fc.
 // =============================================================================
@@ -39,6 +46,8 @@ struct PID
   float integrator = 0.0f;
   float prevMeasurement = 0.0f;
   float prevSetpoint = 0.0f;
+  float lastOutput = 0.0f;
+  bool  primed = false;
   bool  outputSaturated = false;     // set externally by mixer if it clipped
 
   // Filters (init via configure())
@@ -81,6 +90,8 @@ struct PID
     integrator = 0.0f;
     prevMeasurement = 0.0f;
     prevSetpoint = 0.0f;
+    lastOutput = 0.0f;
+    primed = false;
     outputSaturated = false;
     dNotch.reset();
     dLpf1.reset();
@@ -91,11 +102,19 @@ struct PID
 
   // ── Update ────────────────────────────────────────────────────────────────
   // setpoint, measurement: same units (rad/s recommended for rate loop).
-  // dt: seconds (used only for I & error derivative). Sample rate fixed at
-  //     configure() time for filter coefficients — call at that rate.
+  // dt: seconds (used for I, D and F). Filter coefficients are fixed at
+  //     configure() time — call at (approximately) that rate.
   inline float update(float dt, float setpoint, float measurement)
   {
     if (dt <= 0.0f) dt = 1e-3f;
+
+    if (!primed)
+    {
+      // First sample after reset: no history → no derivative terms.
+      prevMeasurement = measurement;
+      prevSetpoint    = setpoint;
+      primed = true;
+    }
 
     // --- P -----------------------------------------------------------------
     const float error = setpoint - measurement;
@@ -120,7 +139,7 @@ struct PID
       F = kf * fLpf.update(rawF);
     }
 
-    // --- I with relax + saturation-aware anti-windup -----------------------
+    // --- I with relax + conditional anti-windup ----------------------------
     float iErr = error;
     if (ki > 0.0f && relaxRateDps > 0.0f)
     {
@@ -133,12 +152,17 @@ struct PID
       iErr *= factor;
     }
 
-    if (ki > 0.0f && !outputSaturated)
+    if (ki > 0.0f)
     {
-      integrator += iErr * dt;
-      const float iLim = iLimit / ki;
-      if (integrator >  iLim) integrator =  iLim;
-      if (integrator < -iLim) integrator = -iLim;
+      // Integrate unless the mixer is saturated AND we'd push further into it.
+      const bool allowI = !outputSaturated || (iErr * lastOutput < 0.0f);
+      if (allowI)
+      {
+        integrator += iErr * dt;
+        const float iLim = iLimit / ki;
+        if (integrator >  iLim) integrator =  iLim;
+        if (integrator < -iLim) integrator = -iLim;
+      }
     }
     const float I = ki * integrator;
 
@@ -149,6 +173,7 @@ struct PID
 
     prevMeasurement = measurement;
     prevSetpoint    = setpoint;
+    lastOutput      = out;
 
     return out;
   }

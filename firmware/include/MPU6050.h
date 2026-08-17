@@ -3,11 +3,40 @@
 #include <Arduino.h>
 #include <Wire.h>
 
+// =============================================================================
+//  MPU6050 — FRD body-frame IMU driver with level/bias calibration.
+//
+//  Changes vs previous revision (drift-related, no axis/sign changes):
+//    • calibrate() now applies the accel scale factors BEFORE computing the
+//      Rodrigues level rotation and the biases — exactly the same order that
+//      applyCalibration() uses at run time. Previously scale was applied
+//      after rotation, so the stored bias didn't match the run-time path.
+//    • Z accel bias is now chosen so that a resting drone reads exactly
+//      +1.000 g (8192 counts). Previously it rested at ~0.957 g.
+//    • Gyro biases are rounded, not truncated (was up to 1 LSB = 0.06 dps off).
+//    • New calibrateGyro(): gyro-only re-zero (fast, no level surface needed),
+//      used at every boot because the MPU6050 gyro zero moves with temperature
+//      while the level rotation R and accel bias are stable and can be saved.
+//    • New setCalibration()/getters so main can persist R + accel bias in NVS.
+//    • Sensor-frame ("silicon") accel calibration is now bias + scale per axis
+//      (accelOffset[], accelScale[]) applied to the raw counts BEFORE the
+//      mounting rotation — the ellipsoid → unit-sphere correction. The
+//      offsets/scales come from the in-firmware 6-face routine (see main.cpp)
+//      and are stored in NVS. Defaults = your old ACCEL_SCALE constants, offset 0.
+//
+//  Calibration pipeline (applyCalibration):
+//      raw counts (sign-flipped to FRD by readRaw)
+//        → (raw - accelOffset) * accelScale       sensor-frame ellipsoid → sphere
+//        → R ·                                    mounting tilt (level surface)
+//        → - accelBias                            tiny residual so rest = (0,0,+1 g)
+// =============================================================================
 struct MPU6050
 {
-    const float ACCEL_SCALE_X = 0.997124f;
-    const float ACCEL_SCALE_Y = 1.000907f;
-    const float ACCEL_SCALE_Z = 0.956723f;
+    // Sensor-frame accel calibration (in the frame readRaw() outputs).
+    // Fill from the 6-face routine; defaults = previous scale constants.
+    float accelScale[3] = {0.997124f, 1.000907f, 0.956723f};
+    float accelOffset[3] = {0.0f, 0.0f, 0.0f}; // LSB
+
     // ---- Public sample type ----
     struct Data
     {
@@ -74,7 +103,7 @@ struct MPU6050
         if (!writeByte(REG_CONFIG, 0x03))
             return false; // DLPF 42 Hz
         if (!writeByte(REG_SMPLRT_DIV, 0))
-            return false; // 500 Hz output
+            return false; // 1 kHz output (DLPF on)
         if (!writeByte(REG_GYRO_CFG, 0x18))
             return false; // ±2000 dps
         if (!writeByte(REG_ACCEL_CFG, 0x08))
@@ -101,6 +130,8 @@ struct MPU6050
     // Read raw sensor data into d (without applying calibration). Returns true on success.
     bool readRawSample(Data &d) { return readRaw(d); }
 
+    // ── Full calibration: level rotation R + accel bias + gyro bias ──────────
+    // Drone MUST rest on a level surface (this defines "level" for the FC).
     void calibrate(int N = 500)
     {
         long sumAx = 0, sumAy = 0, sumAz = 0;
@@ -114,7 +145,6 @@ struct MPU6050
             delay(5);
         }
 
-        // Accumulate N samples
         for (int i = 0; i < N; ++i)
         {
             while (!readRaw(s))
@@ -128,100 +158,72 @@ struct MPU6050
             delay(2);
         }
 
-        const float avgAx = (float)sumAx / N;
-        const float avgAy = (float)sumAy / N;
-        const float avgAz = (float)sumAz / N;
+        // Sensor-frame offset+scale FIRST — same order as applyCalibration()
+        const float sAx = ((float)sumAx / N - accelOffset[0]) * accelScale[0];
+        const float sAy = ((float)sumAy / N - accelOffset[1]) * accelScale[1];
+        const float sAz = ((float)sumAz / N - accelOffset[2]) * accelScale[2];
 
-        // ── Rodrigues: rotate measured gravity vector onto (0,0,1) ──────────────
-        //
-        // gS = measured gravity in sensor frame (normalised)
-        // zB = target gravity direction in body frame = (0, 0, 1)  [FRD, down]
-        //
-        // rotation axis  v = gS × zB
-        // cross product of (gx,gy,gz) × (0,0,1):
-        //   vx =  gy*1 - gz*0 =  gy
-        //   vy =  gz*0 - gx*1 = -gx
-        //   vz =  gx*0 - gy*0 =  0
-        //
-        // cos(angle) c = gS · zB = gz  (after normalisation)
-        // sin(angle) s_mag = |v|
+        computeLevelRotation(sAx, sAy, sAz);
 
-        float mag = sqrtf(avgAx * avgAx + avgAy * avgAy + avgAz * avgAz);
-        float gx = avgAx / mag;
-        float gy = avgAy / mag;
-        float gz = avgAz / mag;
+        // Rotate the averaged (scaled) gravity vector into the body frame
+        float cAx, cAy, cAz;
+        rotate(sAx, sAy, sAz, cAx, cAy, cAz);
 
-        float vx = gy;
-        float vy = -gx;
-        float vz = 0.0f;
-        float s_mag = sqrtf(vx * vx + vy * vy); // vz is always 0
-        float c_val = gz;                       // dot product with (0,0,1)
+        // After rotation gravity lies on +Z. Bias so that rest reads (0, 0, +1 g).
+        accelBiasX = (int16_t)roundf(cAx);
+        accelBiasY = (int16_t)roundf(cAy);
+        accelBiasZ = (int16_t)roundf(cAz - Data::ACCEL_SENS_4G);
 
-        if (s_mag < 1e-6f)
+        setGyroBiasFromRawAverage((float)sumGx / N, (float)sumGy / N, (float)sumGz / N);
+    }
+
+    // ── Gyro-only re-zero. Any orientation, must be still. ~1.1 s @ N=500 ────
+    void calibrateGyro(int N = 500)
+    {
+        long sumGx = 0, sumGy = 0, sumGz = 0;
+        Data s;
+        for (int i = 0; i < 20; ++i)
         {
-            // Already (nearly) aligned — keep identity
-            R[0][0] = 1;
-            R[0][1] = 0;
-            R[0][2] = 0;
-            R[1][0] = 0;
-            R[1][1] = 1;
-            R[1][2] = 0;
-            R[2][0] = 0;
-            R[2][1] = 0;
-            R[2][2] = 1;
+            readRaw(s);
+            delay(2);
         }
-        else
+        for (int i = 0; i < N; ++i)
         {
-            // Rodrigues' formula:  R = I + [v]× + [v]×² · (1-c)/s²
-            //
-            // [v]× (skew-symmetric):          [v]×²:
-            //  [ 0  -vz  vy ]                 [-vz²-vy²   vx·vy   vx·vz]
-            //  [ vz   0  -vx]                 [ vx·vy  -vz²-vx²   vy·vz]
-            //  [-vy  vx   0 ]                 [ vx·vz   vy·vz  -vy²-vx²]
-
-            // Normalise the rotation axis before using in Rodrigues
-            float inv_s = 1.0f / s_mag;
-            float nvx = vx * inv_s;
-            float nvy = vy * inv_s;
-            float nvz = 0.0f; // always 0
-
-            float sin_t = s_mag;      // sin(θ) = magnitude of un-normalised cross product
-            float k = (1.0f - c_val); // (1 - cos(θ))
-
-            R[0][0] = 1.0f + k * (-nvz * nvz - nvy * nvy);
-            R[0][1] = k * (nvx * nvy) - sin_t * nvz; // nvz=0, so: k*(nvx*nvy)
-            R[0][2] = k * (nvx * nvz) + sin_t * nvy; // nvz=0, so: sin_t*nvy
-            R[1][0] = k * (nvx * nvy) + sin_t * nvz; // nvz=0, so: k*(nvx*nvy)
-            R[1][1] = 1.0f + k * (-nvz * nvz - nvx * nvx);
-            R[1][2] = k * (nvy * nvz) - sin_t * nvx; // nvz=0, so: -sin_t*nvx
-            R[2][0] = k * (nvx * nvz) - sin_t * nvy; // nvz=0, so: -sin_t*nvy
-            R[2][1] = k * (nvy * nvz) + sin_t * nvx; // nvz=0, so: +sin_t*nvx
-            R[2][2] = 1.0f + k * (-nvy * nvy - nvx * nvx);
+            while (!readRaw(s))
+                delay(1);
+            sumGx += s.gyroX;
+            sumGy += s.gyroY;
+            sumGz += s.gyroZ;
+            delay(2);
         }
+        setGyroBiasFromRawAverage((float)sumGx / N, (float)sumGy / N, (float)sumGz / N);
+    }
 
-        // After rotating the averaged raw vector:
-        float cAx = R[0][0] * avgAx + R[0][1] * avgAy + R[0][2] * avgAz;
-        float cAy = R[1][0] * avgAx + R[1][1] * avgAy + R[1][2] * avgAz;
-        float cAz = R[2][0] * avgAx + R[2][1] * avgAy + R[2][2] * avgAz;
+    // ── Sensor-frame accel calibration (from 6-face routine) ─────────────────
+    void setAccelSensorCal(const float scale[3], const float offset[3])
+    {
+        for (int i = 0; i < 3; ++i)
+        {
+            accelScale[i] = scale[i];
+            accelOffset[i] = offset[i];
+        }
+    }
 
-        // Apply scale before storing bias so units match applyCalibration
-        accelBiasX = (int16_t)roundf(cAx * ACCEL_SCALE_X);
-        accelBiasY = (int16_t)roundf(cAy * ACCEL_SCALE_Y);
-        accelBiasZ = (int16_t)roundf(cAz * ACCEL_SCALE_Z) - (int16_t)(Data::ACCEL_SENS_4G * ACCEL_SCALE_Z);
-
-        // Gyro bias is a pure offset (direction-invariant), rotate it too
-        // so it lives in the same body frame as the corrected readings
-        float avgGx = (float)sumGx / N;
-        float avgGy = (float)sumGy / N;
-        float avgGz = (float)sumGz / N;
-
-        float cGx = R[0][0] * avgGx + R[0][1] * avgGy + R[0][2] * avgGz;
-        float cGy = R[1][0] * avgGx + R[1][1] * avgGy + R[1][2] * avgGz;
-        float cGz = R[2][0] * avgGx + R[2][1] * avgGy + R[2][2] * avgGz;
-
-        gyroBiasX = (int16_t)cGx;
-        gyroBiasY = (int16_t)cGy;
-        gyroBiasZ = (int16_t)cGz;
+    // ── Persistence helpers (level rotation + accel bias are temperature-stable)
+    void setCalibration(const float rot[9], int16_t abx, int16_t aby, int16_t abz)
+    {
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+                R[r][c] = rot[r * 3 + c];
+        accelBiasX = abx;
+        accelBiasY = aby;
+        accelBiasZ = abz;
+    }
+    void getRotation(float rot[9]) const
+    {
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+                rot[r * 3 + c] = R[r][c];
     }
 
     // Biases (public if you want to save/load them)
@@ -235,7 +237,7 @@ struct MPU6050
     String calibrationToString() const
     {
         String s;
-        s.reserve(100);
+        s.reserve(260);
         s += "Accel Biases: X=";
         s += accelBiasX;
         s += ", Y=";
@@ -248,6 +250,25 @@ struct MPU6050
         s += gyroBiasY;
         s += ", Z=";
         s += gyroBiasZ;
+        s += " | AccScale=(";
+        s += String(accelScale[0], 5);
+        s += ",";
+        s += String(accelScale[1], 5);
+        s += ",";
+        s += String(accelScale[2], 5);
+        s += ") AccOff=(";
+        s += String(accelOffset[0], 1);
+        s += ",";
+        s += String(accelOffset[1], 1);
+        s += ",";
+        s += String(accelOffset[2], 1);
+        s += ") | R row3=(";
+        s += String(R[2][0], 4);
+        s += ",";
+        s += String(R[2][1], 4);
+        s += ",";
+        s += String(R[2][2], 4);
+        s += ")";
         return s;
     }
 
@@ -265,6 +286,66 @@ private:
     uint8_t addr = 0x68;
 
     Data sample;
+
+    void rotate(float x, float y, float z, float &ox, float &oy, float &oz) const
+    {
+        ox = R[0][0] * x + R[0][1] * y + R[0][2] * z;
+        oy = R[1][0] * x + R[1][1] * y + R[1][2] * z;
+        oz = R[2][0] * x + R[2][1] * y + R[2][2] * z;
+    }
+
+    void setGyroBiasFromRawAverage(float avgGx, float avgGy, float avgGz)
+    {
+        // Gyro bias is a pure offset in the sensor frame; rotate it into the
+        // body frame so it matches the rotated readings in applyCalibration().
+        float cGx, cGy, cGz;
+        rotate(avgGx, avgGy, avgGz, cGx, cGy, cGz);
+        gyroBiasX = (int16_t)roundf(cGx);
+        gyroBiasY = (int16_t)roundf(cGy);
+        gyroBiasZ = (int16_t)roundf(cGz);
+    }
+
+    // ── Rodrigues: rotate measured gravity vector onto (0,0,1) ──────────────
+    //
+    // gS = measured gravity in sensor frame (normalised)
+    // zB = target gravity direction in body frame = (0, 0, 1)  [FRD, down]
+    // rotation axis  v = gS × zB = (gy, -gx, 0),  cos = gz, sin = |v|
+    void computeLevelRotation(float ax, float ay, float az)
+    {
+        const float mag = sqrtf(ax * ax + ay * ay + az * az);
+        const float gx = ax / mag;
+        const float gy = ay / mag;
+        const float gz = az / mag;
+
+        const float vx = gy;
+        const float vy = -gx;
+        const float s_mag = sqrtf(vx * vx + vy * vy); // sin(theta)
+        const float c_val = gz;                       // cos(theta)
+
+        if (s_mag < 1e-6f)
+        {
+            R[0][0] = 1; R[0][1] = 0; R[0][2] = 0;
+            R[1][0] = 0; R[1][1] = 1; R[1][2] = 0;
+            R[2][0] = 0; R[2][1] = 0; R[2][2] = 1;
+            return;
+        }
+
+        // Rodrigues' formula:  R = I + sin(θ)[n]× + (1-cos θ)[n]×²   (n = v/|v|, nz = 0)
+        const float nvx = vx / s_mag;
+        const float nvy = vy / s_mag;
+        const float sin_t = s_mag;
+        const float k = 1.0f - c_val;
+
+        R[0][0] = 1.0f - k * nvy * nvy;
+        R[0][1] = k * nvx * nvy;
+        R[0][2] = sin_t * nvy;
+        R[1][0] = k * nvx * nvy;
+        R[1][1] = 1.0f - k * nvx * nvx;
+        R[1][2] = -sin_t * nvx;
+        R[2][0] = -sin_t * nvy;
+        R[2][1] = sin_t * nvx;
+        R[2][2] = 1.0f - k * (nvx * nvx + nvy * nvy);
+    }
 
     bool writeByte(uint8_t reg, uint8_t value)
     {
@@ -290,7 +371,7 @@ private:
         return true;
     }
 
-    // Raw read: sign flips -> FRD, no calibration applied.
+    // Raw read: sign flips -> FRD, no calibration applied.  (UNCHANGED — axes verified)
     bool readRaw(Data &d)
     {
         uint8_t raw[14];
@@ -314,19 +395,15 @@ private:
 
     void applyCalibration(Data &d)
     {
-        // Step 0: scale correction (float, no truncation)
-        float sx = d.accelX * ACCEL_SCALE_X;
-        float sy = d.accelY * ACCEL_SCALE_Y;
-        float sz = d.accelZ * ACCEL_SCALE_Z;
+        // Step 0: sensor-frame ellipsoid → sphere (offset, then scale; float)
+        const float sx = (d.accelX - accelOffset[0]) * accelScale[0];
+        const float sy = (d.accelY - accelOffset[1]) * accelScale[1];
+        const float sz = (d.accelZ - accelOffset[2]) * accelScale[2];
 
-        // Step 1: rotate
-        float ax = R[0][0] * sx + R[0][1] * sy + R[0][2] * sz;
-        float ay = R[1][0] * sx + R[1][1] * sy + R[1][2] * sz;
-        float az = R[2][0] * sx + R[2][1] * sy + R[2][2] * sz;
-
-        float gx = R[0][0] * d.gyroX + R[0][1] * d.gyroY + R[0][2] * d.gyroZ;
-        float gy = R[1][0] * d.gyroX + R[1][1] * d.gyroY + R[1][2] * d.gyroZ;
-        float gz = R[2][0] * d.gyroX + R[2][1] * d.gyroY + R[2][2] * d.gyroZ;
+        // Step 1: rotate into body frame
+        float ax, ay, az, gx, gy, gz;
+        rotate(sx, sy, sz, ax, ay, az);
+        rotate(d.gyroX, d.gyroY, d.gyroZ, gx, gy, gz);
 
         // Step 2: subtract bias (single int16 conversion at the end)
         d.accelX = (int16_t)roundf(ax) - accelBiasX;

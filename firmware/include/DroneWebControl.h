@@ -4,6 +4,19 @@
 #include <WiFi.h>
 #include <WebServer.h>
 
+// =============================================================================
+//  DroneWebControl — soft-AP web joystick UI + control link failsafe.
+//
+//  Changes vs previous revision:
+//    • Level TRIM (roll/pitch, degrees) — /trim endpoint + buttons in the UI.
+//      This is the fix for the classic "sensor level ≠ thrust level" drift
+//      that neither the accelerometer nor the drag observer can see.
+//    • "Recalibrate level" button (/calib) — honoured by main only when
+//      disarmed, drone flat on a level surface.
+//    • Live telemetry (attitude, velocity estimate, trims) in /status and UI,
+//      polled at 2 Hz so you can watch what the FC believes while diagnosing.
+//    • Command path, failsafe and joystick semantics are UNCHANGED.
+// =============================================================================
 class DroneWebControl
 {
 public:
@@ -15,6 +28,8 @@ public:
     float thrust = 0.0f; // [0,1]
     bool armed = false;
   };
+
+  static constexpr float TRIM_MAX_DEG = 6.0f;
 
   DroneWebControl() : server(80) {}
 
@@ -41,6 +56,12 @@ public:
               { handleCmd(); });
     server.on("/status", HTTP_GET, [&]()
               { handleStatus(); });
+    server.on("/trim", HTTP_GET, [&]()
+              { handleTrim(); });
+    server.on("/calib", HTTP_GET, [&]()
+              { handleCalib(); });
+    server.on("/cal6", HTTP_GET, [&]()
+              { handleCal6(); });
     server.onNotFound([&]()
                       { handleRoot(); });
 
@@ -75,7 +96,7 @@ public:
     }
   }
 
-  // Compatibility with your existing loop code:
+  // Compatibility with existing loop code:
   bool hasNewRight() const { return newCmdFlag; }   // "new input arrived"
   bool hasNewCommand() const { return newCmdFlag; } // alias
 
@@ -91,6 +112,59 @@ public:
 
   void setFailsafeMs(uint32_t ms) { failsafeMs = ms; }
 
+  // ── Trim (degrees, + roll = right wing down, + pitch = nose up) ───────────
+  void setTrim(float rollDeg, float pitchDeg)
+  {
+    trimRollDeg = clampf(rollDeg, -TRIM_MAX_DEG, TRIM_MAX_DEG);
+    trimPitchDeg = clampf(pitchDeg, -TRIM_MAX_DEG, TRIM_MAX_DEG);
+  }
+  void getTrim(float &rollDeg, float &pitchDeg) const
+  {
+    rollDeg = trimRollDeg;
+    pitchDeg = trimPitchDeg;
+  }
+  bool takeTrimChanged()
+  {
+    const bool c = trimChangedFlag;
+    trimChangedFlag = false;
+    return c;
+  }
+
+  // ── Recalibration request (main honours it only when disarmed) ───────────
+  bool takeCalibrateRequest()
+  {
+    const bool c = calibRequested;
+    calibRequested = false;
+    return c;
+  }
+
+  // ── 6-face accel calibration wizard (main executes, UI drives) ───────────
+  //  request: 0 = none, 1 = capture next face, 2 = restart
+  int takeCal6Request()
+  {
+    const int r = cal6Request;
+    cal6Request = 0;
+    return r;
+  }
+  // main reports progress: face index (0..6 = done) and a short message
+  void setCal6State(int nextFace, const String &msg)
+  {
+    cal6Face = nextFace;
+    cal6Msg = msg;
+  }
+
+  // ── Telemetry pushed by main (shown in /status) ───────────────────────────
+  void setTelemetry(float rollDeg, float pitchDeg, float yawDeg,
+                    float velX, float velY, const char *state)
+  {
+    tRoll = rollDeg;
+    tPitch = pitchDeg;
+    tYaw = yawDeg;
+    tVx = velX;
+    tVy = velY;
+    tState = state;
+  }
+
 private:
   WebServer server;
   DroneCommand cmd;
@@ -100,6 +174,16 @@ private:
 
   bool cutThrottleOnClientLost = true;
   bool cutThrottleOnCmdTimeout = true; // "control link lost" = no /cmd updates
+
+  float trimRollDeg = 0.0f, trimPitchDeg = 0.0f;
+  bool trimChangedFlag = false;
+  bool calibRequested = false;
+  int cal6Request = 0;
+  int cal6Face = 0;
+  String cal6Msg = "not started";
+
+  float tRoll = 0, tPitch = 0, tYaw = 0, tVx = 0, tVy = 0;
+  const char *tState = "boot";
 
   static float clampf(float v, float lo, float hi)
   {
@@ -147,15 +231,86 @@ private:
     server.send(200, "text/plain", "OK");
   }
 
+  void handleTrim()
+  {
+    if (server.hasArg("roll") || server.hasArg("pitch"))
+    {
+      float r = trimRollDeg, p = trimPitchDeg;
+      if (server.hasArg("roll"))
+        r = server.arg("roll").toFloat();
+      if (server.hasArg("pitch"))
+        p = server.arg("pitch").toFloat();
+      setTrim(r, p);
+      trimChangedFlag = true;
+    }
+    server.send(200, "application/json", trimJson());
+  }
+
+  void handleCalib()
+  {
+    if (cmd.armed)
+    {
+      server.send(200, "text/plain", "ARMED");
+      return;
+    }
+    calibRequested = true;
+    server.send(200, "text/plain", "OK");
+  }
+
+  void handleCal6()
+  {
+    if (cmd.armed)
+    {
+      server.send(200, "text/plain", "ARMED");
+      return;
+    }
+    const String c = server.hasArg("cmd") ? server.arg("cmd") : String("capture");
+    cal6Request = (c == "reset") ? 2 : 1;
+    server.send(200, "text/plain", "OK");
+  }
+
+  static String jsonEscape(const String &in)
+  {
+    String o;
+    o.reserve(in.length() + 8);
+    for (unsigned i = 0; i < in.length(); ++i)
+    {
+      const char ch = in[i];
+      if (ch == '"' || ch == '\\')
+      {
+        o += '\\';
+        o += ch;
+      }
+      else if (ch == '\n')
+        o += "\\n";
+      else
+        o += ch;
+    }
+    return o;
+  }
+
+  String trimJson() const
+  {
+    String j = "{\"roll\":" + String(trimRollDeg, 2) + ",\"pitch\":" + String(trimPitchDeg, 2) + "}";
+    return j;
+  }
+
   void handleStatus()
   {
-    String json = "{";
+    String json;
+    json.reserve(600);
+    json += "{";
     json += "\"ip\":\"" + apIP().toString() + "\",";
     json += "\"roll\":" + String(cmd.roll, 3) + ",";
     json += "\"pitch\":" + String(cmd.pitch, 3) + ",";
     json += "\"yaw\":" + String(cmd.yaw, 3) + ",";
     json += "\"thrust\":" + String(cmd.thrust, 3) + ",";
-    json += "\"armed\":" + String(cmd.armed ? "true" : "false");
+    json += "\"armed\":" + String(cmd.armed ? "true" : "false") + ",";
+    json += "\"trim\":" + trimJson() + ",";
+    json += "\"att\":{\"roll\":" + String(tRoll, 1) + ",\"pitch\":" + String(tPitch, 1) + ",\"yaw\":" + String(tYaw, 1) + "},";
+    json += "\"vel\":{\"x\":" + String(tVx, 2) + ",\"y\":" + String(tVy, 2) + "},";
+    json += "\"cal6\":{\"face\":" + String(cal6Face) + ",\"msg\":\"" + jsonEscape(cal6Msg) + "\"},";
+    json += "\"state\":\"" + String(tState) + "\"";
     json += "}";
     server.send(200, "application/json", json);
   }
@@ -165,7 +320,7 @@ private:
     server.send_P(200, "text/html", htmlPage());
   }
 
-  // --- Web UI (2 joysticks + thrust slider + arm toggle) ---
+  // --- Web UI (2 joysticks + thrust slider + arm toggle + trim + telemetry) ---
   static const char *htmlPage()
   {
     return R"HTML(
@@ -218,8 +373,13 @@ private:
       font-weight: 600;
     }
     .btn.off { background: #444; }
+    .btn.sm { padding: 8px 10px; font-size: 13px; }
+    .btn.warn { background: #8a5a12; }
     .small { font-size: 12px; opacity:.85; }
     .pill { padding: 6px 10px; border-radius: 999px; background: rgba(255,255,255,.08); }
+    .trimPad { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:6px; max-width: 260px; margin: 8px auto; }
+    .trimPad .btn { width:100%; }
+    .trimPad .center { text-align:center; align-self:center; }
   </style>
 </head>
 <body>
@@ -258,6 +418,56 @@ private:
           <div class="joyTitle">Roll / Pitch</div>
           <div class="base" id="joyR"><div class="stick" id="stickR"></div></div>
         </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <div class="lbl">Level trim</div>
+        <div class="pill val" id="trimVal">roll 0.00° • pitch 0.00°</div>
+      </div>
+      <div class="trimPad">
+        <div></div>
+        <button class="btn sm" id="tFwd">&#9650; Fwd</button>
+        <div></div>
+        <button class="btn sm" id="tLeft">&#9664; Left</button>
+        <button class="btn sm off" id="tReset">Reset</button>
+        <button class="btn sm" id="tRight">Right &#9654;</button>
+        <div></div>
+        <button class="btn sm" id="tBack">&#9660; Back</button>
+        <div></div>
+      </div>
+      <div class="small">Press the direction the drone should move <b>toward</b> (opposite to the drift). 0.2° per press, saved on the drone.</div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <div class="lbl">Telemetry</div>
+        <div class="pill val" id="stateVal">—</div>
+      </div>
+      <div style="height:8px"></div>
+      <div class="val" id="attVal">att: — </div>
+      <div class="val" id="velVal">vel: — </div>
+      <div style="height:10px"></div>
+      <div class="row">
+        <div class="small">Disarmed, drone flat on a level surface, don't touch it for ~2 s.</div>
+        <button class="btn sm warn" id="calibBtn">Recalibrate level</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <div class="lbl">Accel 6-face calibration (silicon offsets)</div>
+        <button class="btn sm off" id="cal6Reset">Restart</button>
+      </div>
+      <div style="height:8px"></div>
+      <div class="val" id="cal6Next">—</div>
+      <div style="height:6px"></div>
+      <div class="val" id="cal6Msg" style="white-space:pre-line">—</div>
+      <div style="height:10px"></div>
+      <div class="row">
+        <div class="small">Disarmed. Hold the drone still against a flat wall/table edge in the shown pose, then press Capture (~2.5 s). Do the six poses in any order except the LAST: flat, right side up, on your LEVEL surface — the level calibration runs right after it.</div>
+        <button class="btn sm warn" id="cal6Btn">Capture</button>
       </div>
     </div>
   </div>
@@ -391,6 +601,68 @@ private:
     (nx, ny) => { roll = nx; pitch = -ny; },
     () => { roll = 0; pitch = 0; }
   );
+
+  // ── Trim ─────────────────────────────────────────────────────────────────
+  // + roll trim = lean right (drone moves right); + pitch trim = nose up (drone moves back)
+  let trimRoll = 0, trimPitch = 0;
+  const TRIM_STEP = 0.2;
+  const trimValEl = document.getElementById('trimVal');
+  function showTrim(){ trimValEl.textContent = `roll ${trimRoll.toFixed(2)}° • pitch ${trimPitch.toFixed(2)}°`; }
+  function sendTrim(r, p){
+    fetch(`/trim?roll=${r.toFixed(2)}&pitch=${p.toFixed(2)}`)
+      .then(x => x.json()).then(j => { trimRoll = j.roll; trimPitch = j.pitch; showTrim(); })
+      .catch(()=>{});
+  }
+  document.getElementById('tLeft').addEventListener('click',  () => sendTrim(trimRoll - TRIM_STEP, trimPitch));
+  document.getElementById('tRight').addEventListener('click', () => sendTrim(trimRoll + TRIM_STEP, trimPitch));
+  document.getElementById('tFwd').addEventListener('click',   () => sendTrim(trimRoll, trimPitch - TRIM_STEP)); // nose down → forward
+  document.getElementById('tBack').addEventListener('click',  () => sendTrim(trimRoll, trimPitch + TRIM_STEP)); // nose up → back
+  document.getElementById('tReset').addEventListener('click', () => sendTrim(0, 0));
+
+  // ── Recalibrate level ────────────────────────────────────────────────────
+  document.getElementById('calibBtn').addEventListener('click', () => {
+    if (armed) { alert('Disarm first.'); return; }
+    if (!confirm('Drone flat on a LEVEL surface and untouched? Calibration takes ~2 s.')) return;
+    fetch('/calib').catch(()=>{});
+  });
+
+  // ── 6-face accel calibration ─────────────────────────────────────────────
+  const CAL6_POSES = [
+    'Pose 1/6: NOSE to the ceiling (drone standing on its tail)',
+    'Pose 2/6: NOSE to the floor',
+    'Pose 3/6: RIGHT side to the ceiling (drone on its left side)',
+    'Pose 4/6: LEFT side to the ceiling',
+    'Pose 5/6: UPSIDE DOWN, flat',
+    'Pose 6/6: FLAT, right side up, on the LEVEL surface (last!)',
+    'Done — results below. Level calibration was run on pose 6.'
+  ];
+  const cal6NextEl = document.getElementById('cal6Next');
+  const cal6MsgEl = document.getElementById('cal6Msg');
+  document.getElementById('cal6Btn').addEventListener('click', () => {
+    if (armed) { alert('Disarm first.'); return; }
+    fetch('/cal6?cmd=capture').catch(()=>{});
+  });
+  document.getElementById('cal6Reset').addEventListener('click', () => {
+    fetch('/cal6?cmd=reset').catch(()=>{});
+  });
+
+  // ── Telemetry poll (2 Hz) ────────────────────────────────────────────────
+  const stateEl = document.getElementById('stateVal');
+  const attEl = document.getElementById('attVal');
+  const velEl = document.getElementById('velVal');
+  function poll(){
+    fetch('/status').then(x => x.json()).then(j => {
+      trimRoll = j.trim.roll; trimPitch = j.trim.pitch; showTrim();
+      stateEl.textContent = j.state;
+      attEl.textContent = `att: roll ${j.att.roll}° pitch ${j.att.pitch}° yaw ${j.att.yaw}°`;
+      velEl.textContent = `vel est: x ${j.vel.x} m/s  y ${j.vel.y} m/s`;
+      const f = Math.max(0, Math.min(6, j.cal6.face|0));
+      cal6NextEl.textContent = CAL6_POSES[f];
+      cal6MsgEl.textContent = j.cal6.msg;
+    }).catch(()=>{});
+  }
+  setInterval(poll, 500);
+  poll();
 
   // On page close: send safe command
   window.addEventListener('beforeunload', () => {
